@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Copyright (c) 2024 Luka Panio <lukapanio@gmail.com>
+// Copyright (c) 2026 userg0d <id.usergod@gmail.com>
 
 #include <linux/backlight.h>
 #include <linux/delay.h>
@@ -18,9 +18,12 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/display/drm_dsc.h>
 #include <drm/display/drm_dsc_helper.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
 
 struct nt36532 {
 	struct drm_panel panel;
+	struct drm_connector *connector;
 	struct mipi_dsi_device *dsi[2];
 	const struct panel_desc *desc;
 	struct drm_dsc_config dsc;
@@ -39,6 +42,8 @@ struct panel_desc {
 	unsigned long mode_flags;
 	enum mipi_dsi_pixel_format format;
 
+	const struct drm_display_mode *modes;
+	unsigned int num_modes;
 	const struct mipi_dsi_device_info dsi_info;
 	int (*init_sequence)(struct nt36532 *ctx);
 };
@@ -80,12 +85,37 @@ static int nt36532_read_display_maker(struct nt36532 *ctx)
 	return 0;
 }
 
+static int nt36532_get_current_mode(struct nt36532 *ctx)
+{
+	struct drm_connector *connector = ctx->connector;
+	struct drm_crtc_state *crtc_state;
+	int i;
+
+	/* Return the default (first) mode if no info available yet */
+	if (!connector->state || !connector->state->crtc)
+		return 0;
+
+	crtc_state = connector->state->crtc->state;
+
+	for (i = 0; i < ctx->desc->num_modes; i++) {
+		if (drm_mode_match(&crtc_state->mode,
+				   &ctx->desc->modes[i],
+				   DRM_MODE_MATCH_TIMINGS | DRM_MODE_MATCH_CLOCK))
+			return i;
+	}
+
+	return 0;
+}
+
 static int pipa_init_sequence(struct nt36532 *ctx)
 {
 	struct mipi_dsi_device *dsi= ctx->dsi[0];
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi[0] };
 	struct device *dev = &dsi->dev;
 	int ret;
+
+	int cur_mode = nt36532_get_current_mode(ctx);
+	int cur_vrefresh = drm_mode_vrefresh(&ctx->desc->modes[cur_mode]);
 
 	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 	if (ctx->dsi[0])
@@ -120,6 +150,9 @@ static int pipa_init_sequence(struct nt36532 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  MIPI_DCS_SET_SCROLL_START, 0xf2);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  MIPI_DCS_EXIT_IDLE_MODE, 0xf2);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  MIPI_DCS_ENTER_IDLE_MODE, 0xf2);
+
+	
+
 
 	ret = mipi_dsi_dcs_set_pixel_format(dsi, 0xef);
 	if (ret < 0) {
@@ -284,8 +317,16 @@ static int pipa_init_sequence(struct nt36532 *ctx)
 
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  0xff, 0x10);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  0xfb, 0x01);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  0xb3, 0x40);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  0xb2, 0x91);
+
+	if (cur_vrefresh == 90 ) {
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb3, 0x80);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb2, 0x00);
+	}
+	else {
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb3, 0x40);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb2, 0x91);
+	}
+
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  0x90, 0x03);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  0x91,
 			       0x89, 0x28, 0x00, 0x14, 0xd2, 0x00, 0x01, 0xf4,
@@ -295,6 +336,7 @@ static int pipa_init_sequence(struct nt36532 *ctx)
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  0x3b, 0x03, 0xd8, 0x1a, 0x0a, 0x0a, 0x00);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  0x51, 0x0f, 0xff);
 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,  0x53, 0x24);
+
 	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
 	if (ret < 0) {
 		dev_err(dev, "Failed to exit sleep mode: %d\n", ret);
@@ -311,29 +353,49 @@ static int pipa_init_sequence(struct nt36532 *ctx)
 
 	return 0;
 }
-
-static const struct drm_display_mode nt36532_mode_120 = {
-	.clock = (1800 + 200 + 4 + 92) * (2880 + 26 + 2 + 214) * 120 / 1000,
-	.hdisplay = 1800,
-	.hsync_start = 1800 + 200,
-	.hsync_end = 1800 + 200 + 4,
-	.htotal = 1800 + 200 + 4 + 92,
-	.vdisplay = 2880,
-	.vsync_start = 2880 + 26,
-	.vsync_end = 2880 + 26 + 2,
-	.vtotal = 2880 + 26 + 2 + 214,
-	.width_mm = 148,
-	.height_mm = 237,
-	.type = DRM_MODE_TYPE_DRIVER,
+static const struct drm_display_mode nt36532_modes[] = {
+    {
+       /* 120Hz mode */
+       .clock = 785245,
+       .hdisplay = 1800,
+       .hsync_start = 1800 + 200,
+       .hsync_end = 1800 + 200 + 4,
+       .htotal = 1800 + 200 + 4 + 92,
+       .vdisplay = 2880,
+       .vsync_start = 2880 + 26,
+       .vsync_end = 2880 + 26 + 2,
+       .vtotal = 2880 + 26 + 2 + 214,
+       .width_mm = 148,
+       .height_mm = 237,
+       .type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
+    },
+    {
+       /* 90Hz mode */
+       .clock = 588934,
+       .hdisplay = 1800,
+       .hsync_start = 1800 + 200,
+       .hsync_end = 1800 + 200 + 4,
+       .htotal = 1800 + 200 + 4 + 92,
+       .vdisplay = 2880,
+       .vsync_start = 2880 + 26,
+       .vsync_end = 2880 + 26 + 2,
+       .vtotal = 2880 + 26 + 2 + 214,
+       .width_mm = 148,
+       .height_mm = 237,
+       .type = DRM_MODE_TYPE_DRIVER,
+    },
 };
+
 static const struct panel_desc pipa_desc = {
+	.modes = nt36532_modes,
+	.num_modes = ARRAY_SIZE(nt36532_modes),
 	.dsi_info = {
 		.type = "pipa",
 		.channel = 0,
 		.node = NULL,
 	},
 	.format = MIPI_DSI_FMT_RGB888,
-	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS,
+	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST | MIPI_DSI_CLOCK_NON_CONTINUOUS | MIPI_DSI_MODE_LPM,
 	.init_sequence = pipa_init_sequence,
 };
 
@@ -416,7 +478,6 @@ fail:
 	regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
 	return ret;
 }
-
 static int nt36532_enable(struct drm_panel *panel)
 {
 	struct nt36532 *ctx = to_nt36532(panel);
@@ -434,6 +495,7 @@ static int nt36532_enable(struct drm_panel *panel)
 	usleep_range(10000, 11000);
 
 	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
+
 
 	print_hex_dump(KERN_INFO, "DSC:", DUMP_PREFIX_NONE, 16,
 	       1, (void *)&pps, sizeof(pps), false);
@@ -479,9 +541,14 @@ static int nt36532_unprepare(struct drm_panel *panel)
 static int nt36532_get_modes(struct drm_panel *panel,
 					struct drm_connector *connector)
 {
-	const struct drm_display_mode *mode;
-	mode = &nt36532_mode_120;
-	return drm_connector_helper_get_modes_fixed(connector, mode);
+	struct nt36532 *ctx = to_nt36532(panel);
+	int count = 0, i;
+
+	for (i = 0; i < ctx->desc->num_modes; i++)
+		count += drm_connector_helper_get_modes_fixed(connector, &ctx->desc->modes[i]);
+
+	ctx->connector = connector;
+	return count;
 }
 
 static const struct drm_panel_funcs nt36532_panel_funcs = {
@@ -622,6 +689,6 @@ static struct mipi_dsi_driver nt36532_driver = {
 };
 module_mipi_dsi_driver(nt36532_driver);
 
-MODULE_AUTHOR("Luka Panio <luakapnio@gmail.com>");
+MODULE_AUTHOR("userg0d <id.usergod@gmail.com>");
 MODULE_DESCRIPTION("DRM panel driver for the Novatek NT36532 Driver-IC");
 MODULE_LICENSE("GPL");
